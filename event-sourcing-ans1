@@ -1,0 +1,295 @@
+Awesome—let’s lock in a clean, future-proof event shape that:
+
+1. is easy to index/query in MongoDB,
+
+
+2. round-trips safely (serialize → store → load → dispatch to the right handler), and
+
+
+3. lets you evolve payloads per event name over time.
+
+
+
+Below is a pragmatic pattern I’ve used for Go + MongoDB + (optionally) Protobuf, but it works great with plain JSON too.
+
+1) Event envelope (Mongo document)
+
+Store one Mongo document per event with an envelope of strongly-typed metadata and a payload blob. Key ideas:
+
+Keep top-level metadata in first-class fields for easy indexing.
+
+Use a type discriminator (name + schema_version) to bind a payload codec/Go struct.
+
+Store payload as JSON (queryable) and optionally also as proto bytes (binary canonical form) if you use protobuf elsewhere.
+
+
+// Envelope is what you store in Mongo as a document.
+type Envelope struct {
+    ID              primitive.ObjectID `bson:"_id,omitempty"`
+    // Core routing
+    Stream          string             `bson:"stream"`          // e.g., "order:9f0c..." or "order-<aggregateID>"
+    AggregateType   string             `bson:"aggregate_type"`  // "order"
+    AggregateID     string             `bson:"aggregate_id"`    // your OrderID
+    Version         int64              `bson:"version"`         // event store version (stream sequence)
+    // Event identity / evolution
+    Name            string             `bson:"name"`            // e.g., "order.created"
+    SchemaVersion   int32              `bson:"schema_version"`  // payload schema version for this event name
+    // Time & tracing
+    OccurredAt      time.Time          `bson:"occurred_at"`
+    Producer        string             `bson:"producer"`        // service name
+    CausationID     string             `bson:"causation_id"`
+    CorrelationID   string             `bson:"correlation_id"`
+    TenantID        string             `bson:"tenant_id,omitempty"`
+    // Payload representations
+    ContentType     string             `bson:"content_type"`    // "application/json" | "application/x-protobuf"
+    PayloadJSON     bson.Raw           `bson:"payload_json,omitempty"`   // JSON payload (query-friendly)
+    PayloadProto    []byte             `bson:"payload_proto,omitempty"`  // optional proto bytes for canonical form
+    // Free-form headers (small, not for large data)
+    Headers         map[string]string  `bson:"headers,omitempty"`
+}
+
+Recommended indexes
+
+{stream: 1, version: 1} unique (append-only stream order)
+
+{aggregate_id: 1, version: 1}
+
+{name: 1, schema_version: 1, occurred_at: -1}
+
+Optional: {correlation_id: 1}, {causation_id: 1}, {tenant_id: 1}
+
+
+2) Payload typing & dispatch
+
+You want to “handle the specific type of metadata related to the event name.” The simplest, robust approach is a registry that maps (name, schemaVersion) → a codec that knows how to (un)marshal to a concrete Go struct.
+
+// EventPayload is marker interface for concrete payloads.
+type EventPayload interface {
+    // Optional: Validate() error
+}
+
+// A codec decouples storage format from your struct types.
+type PayloadCodec interface {
+    Name() string
+    SchemaVersion() int32
+    UnmarshalJSON(raw []byte) (EventPayload, error)
+    MarshalJSON(payload EventPayload) ([]byte, error)
+    // Optional protobuf hooks:
+    UnmarshalProto(raw []byte) (EventPayload, error)
+    MarshalProto(payload EventPayload) ([]byte, error)
+}
+
+// Registry keyed by name+schemaVersion.
+type key struct{ n string; v int32 }
+var codecs = map[key]PayloadCodec{}
+func Register(c PayloadCodec) { codecs[key{c.Name(), c.SchemaVersion()}] = c }
+func findCodec(name string, ver int32) (PayloadCodec, bool) {
+    c, ok := codecs[key{name, ver}]
+    return c, ok
+}
+
+Example payloads
+
+// v1 payloads
+type OrderCreatedV1 struct {
+    OrderID     string    `json:"order_id"`
+    CustomerID  string    `json:"customer_id"`
+    Items       []ItemV1  `json:"items"`
+    Currency    string    `json:"currency"`
+    TotalCents  int64     `json:"total_cents"`
+}
+type ItemV1 struct {
+    SKU     string `json:"sku"`
+    Qty     int32  `json:"qty"`
+    Price   int64  `json:"price_cents"`
+}
+
+type PaymentCapturedV1 struct {
+    OrderID        string `json:"order_id"`
+    PaymentID      string `json:"payment_id"`
+    AmountCents    int64  `json:"amount_cents"`
+    Provider       string `json:"provider"`
+    Authorization  string `json:"authorization"`
+}
+
+JSON codecs (concise, can add Proto later)
+
+type jsonCodec[T EventPayload] struct {
+    name string
+    ver  int32
+}
+
+func (c jsonCodec[T]) Name() string         { return c.name }
+func (c jsonCodec[T]) SchemaVersion() int32 { return c.ver }
+
+func (c jsonCodec[T]) UnmarshalJSON(raw []byte) (EventPayload, error) {
+    var t T
+    if err := json.Unmarshal(raw, &t); err != nil { return nil, err }
+    return t, nil
+}
+func (c jsonCodec[T]) MarshalJSON(p EventPayload) ([]byte, error) {
+    return json.Marshal(p)
+}
+
+// Register your payloads at init():
+func init() {
+    Register(jsonCodec[OrderCreatedV1]{name: "order.created", ver: 1})
+    Register(jsonCodec[PaymentCapturedV1]{name: "payment.captured", ver: 1})
+}
+
+3) Writing events
+
+You create the envelope, pick your content type, and let the codec serialize.
+
+func NewEnvelope(
+    stream, aggregateType, aggregateID string,
+    version int64,
+    name string, schemaVer int32,
+    payload EventPayload,
+    tracing Tracing, // contains causation/correlation/etc
+) (Envelope, error) {
+    c, ok := findCodec(name, schemaVer)
+    if !ok { return Envelope{}, fmt.Errorf("unknown codec for %s v%d", name, schemaVer) }
+
+    // JSON canonical in Mongo is the most query-friendly:
+    payloadJSON, err := c.MarshalJSON(payload)
+    if err != nil { return Envelope{}, err }
+
+    env := Envelope{
+        Stream:        stream,
+        AggregateType: aggregateType,
+        AggregateID:   aggregateID,
+        Version:       version,
+        Name:          name,
+        SchemaVersion: schemaVer,
+        OccurredAt:    time.Now().UTC(),
+        Producer:      tracing.Producer,
+        CausationID:   tracing.CausationID,
+        CorrelationID: tracing.CorrelationID,
+        TenantID:      tracing.TenantID,
+        ContentType:   "application/json",
+        PayloadJSON:   bson.Raw(payloadJSON),
+        Headers:       tracing.Headers,
+    }
+
+    return env, nil
+}
+
+> If you also use Protobuf elsewhere (gRPC/Kafka), you can also store PayloadProto (the canonical wire) next to JSON. That gives you the best of both worlds: Mongo queries on JSON + binary fidelity for interop.
+
+
+
+4) Reading & dispatching
+
+When you pull events from Mongo (for rehydration, projectors, or handlers), bind the payload back to its type using the registry. This isolates all “what type is this payload?” logic to one function.
+
+type TypedEvent struct {
+    Envelope
+    Payload EventPayload
+}
+
+func Bind(env Envelope) (TypedEvent, error) {
+    c, ok := findCodec(env.Name, env.SchemaVersion)
+    if !ok { return TypedEvent{}, fmt.Errorf("no codec for %s v%d", env.Name, env.SchemaVersion) }
+
+    switch env.ContentType {
+    case "application/json":
+        p, err := c.UnmarshalJSON(env.PayloadJSON)
+        if err != nil { return TypedEvent{}, fmt.Errorf("decode %s v%d: %w", env.Name, env.SchemaVersion, err) }
+        return TypedEvent{Envelope: env, Payload: p}, nil
+
+    case "application/x-protobuf":
+        if len(env.PayloadProto) == 0 { return TypedEvent{}, fmt.Errorf("empty proto payload") }
+        p, err := c.UnmarshalProto(env.PayloadProto)
+        if err != nil { return TypedEvent{}, err }
+        return TypedEvent{Envelope: env, Payload: p}, nil
+
+    default:
+        return TypedEvent{}, fmt.Errorf("unsupported content type: %s", env.ContentType)
+    }
+}
+
+Usage in a projector/handler:
+
+evt, _ := Bind(env)
+switch p := evt.Payload.(type) {
+case OrderCreatedV1:
+    // apply to aggregate or projection
+case PaymentCapturedV1:
+    // apply to balance, etc.
+default:
+    // unknown (forward compatible fallback, log/skip)
+}
+
+5) Schema evolution strategy (per event name)
+
+Use name + schema_version to evolve safely:
+
+Backwards-compatible changes (adding optional fields) → bump schema_version only if your consumers are strict; otherwise you can keep v1 and add omitempty fields.
+
+Breaking changes (rename/semantics change) → create v2 payload type and register both v1 and v2 codecs:
+
+Producers start emitting v2.
+
+Consumers handle both until you can retire v1.
+
+
+Keep Version (stream sequence) separate from SchemaVersion (payload).
+
+
+6) Optional: Protobuf integration (cleanly)
+
+If you do use Protobuf:
+
+Define one message per event (not a single “oneof” mega-event). The envelope still has the truthy name and schema_version.
+
+At ingest, marshal the proto to bytes for PayloadProto and, if you want Mongo querying, also keep a JSON shadow (PayloadJSON) by jsonpb/your own converter.
+
+The registry’s codec for that event knows how to go proto↔Go struct (or you can use generated Go structs directly as EventPayload).
+
+
+This avoids the “no event name because it’s a oneof” problem: the envelope carries the name, not the proto. The proto is just the body.
+
+7) Practical Mongo shapes (example docs)
+
+{
+  "_id": { "$oid": "66e1f..." },
+  "stream": "order:9f0c5...",
+  "aggregate_type": "order",
+  "aggregate_id": "9f0c5...",
+  "version": 12,
+  "name": "order.created",
+  "schema_version": 1,
+  "occurred_at": { "$date": "2025-09-11T09:14:22Z" },
+  "producer": "orders-svc",
+  "causation_id": "cmd-123",
+  "correlation_id": "corr-789",
+  "content_type": "application/json",
+  "payload_json": {
+    "order_id": "9f0c5...",
+    "customer_id": "c-123",
+    "items": [{"sku":"SKU-1","qty":2,"price_cents":1299}],
+    "currency": "USD",
+    "total_cents": 2598
+  },
+  "headers": { "region": "eu-west-1" }
+}
+
+8) Why this works well
+
+Mongo-friendly: You can filter by name, time ranges, tenant, and even peek into payload_json for ad-hoc queries (or projection seeds).
+
+Type-safe in Go: Bind gives you the exact payload struct per event name/version.
+
+Versioning clarity: Stream version (ordering) is separate from schema version (payload evolution).
+
+Interoperability: If you need protobuf on the wire, you still can—without sacrificing Mongo queryability.
+
+No circular dependency on “oneof”: The envelope owns the event identity; payloads can be swapped per version cleanly.
+
+
+
+---
+
+If you want, I can adapt this to your existing packages (e.g., your OrdersRepo, Kafka dispatchers, and the Stepper) and show a minimal producer/consumer + Mongo DAO with the indexes and an example migration from order.created v1 → v2.
+
